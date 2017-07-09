@@ -18,6 +18,7 @@ type container = {
   c_writer : Ast.str_item option;
   c_default_func : Ast.str_item option;
   c_reflection : Ast.str_item option;
+  c_wire : Ast.str_item option;
 }
 
 type toplevel = Ast.str_item
@@ -35,6 +36,7 @@ let empty_container name ?default_func ty_str_item =
     c_writer = None;
     c_default_func = default_func;
     c_reflection = None;
+    c_wire = None;
   }
 
 let (|>) x f = f x
@@ -505,6 +507,7 @@ let generate_code ?width containers =
          $maybe_str_item c.c_import_modules$;
          $maybe_str_item c.c_types$;
          $maybe_str_item c.c_reflection$;
+         $maybe_str_item c.c_wire$;
          $maybe_str_item c.c_default_func$;
          $maybe_str_item c.c_pretty_printer$;
          $maybe_str_item c.c_reader$;
@@ -689,6 +692,7 @@ struct
   let _loc = Loc.mk "Gen_OCaml.Reflection"
 
   let repr_name path name = <:expr< $id:ident_with_path _loc path ("repr_"^name)$ >>
+  let repr_wire_name path name = <:expr< $id:ident_with_path _loc path ("repr_wire_"^name)$ >>
 
   let rec repr_message bindings msgname = function
     | `Record l ->
@@ -751,6 +755,41 @@ struct
         expr
     in
     { c with c_reflection = Some <:str_item< value $lid:"repr_"^tyname$ = $expr$; >> }
+
+  let rec repr_ll = function
+  | Vint ((Bool|Int8),_) -> <:expr< Int8 >>
+  | Vint (Int,_) -> <:expr< Varint >>
+  | Bitstring32 _ -> <:expr< Int32 >>
+  | Bitstring64 (Long,_) -> <:expr< Int64 >>
+  | Bitstring64 (Float,_) -> <:expr< Float64 >>
+  | Bytes _ -> <:expr< Bytes >>
+  | Sum (l,_) ->
+    let repr c l = <:expr< $str:c.const_name$, (* $int:string_of_int c.const_tag$,*) $expr_of_list @@ List.map repr_ll l$ >> in
+    let repr = function
+    | `Constant c -> repr c []
+    | `Non_constant (c,l) -> repr c l
+    in
+    <:expr< Sum $expr_of_list @@ List.map repr l$ >>
+  | Record (_name, fields, _) ->
+    let repr f = <:expr< $str:f.field_name$, $repr_ll f.field_type$>> in
+    <:expr< Record $expr_of_list @@ List.map repr fields$ >>
+  | Tuple (l,_) -> <:expr< Tuple $expr_of_list @@ List.map repr_ll l$ >>
+  | Htuple (_,t,_) -> <:expr< Array ($repr_ll t$) >>
+  | Message (path, name, _) -> repr_wire_name (path @ [String.capitalize name]) name
+
+  let repr_ll_field (ctor, _mut, t) = <:expr< $str:ctor$, $repr_ll t$ >>
+
+  let repr_ll_message = function
+  | Message_single (_ns, fields) ->
+    <:expr< Record $expr_of_list @@ List.map repr_ll_field fields$ >>
+  | Message_sum l ->
+    let repr (_ns, ctor, fields) = <:expr< $str:ctor$, $expr_of_list @@ List.map repr_ll_field fields$ >> in
+    <:expr< Sum_record $expr_of_list @@ List.map repr l$ >>
+  | Message_alias (path, name) -> repr_wire_name path name
+
+  let add_msgdecl_wire bindings msgname mexpr _opts c =
+    let expr = repr_ll_message @@ Gencode.low_level_msg_def bindings mexpr in
+    { c with c_wire = Some <:str_item< value $lid:"repr_wire_"^msgname$ = let open Extprot.Types in $expr$; >> }
 
 end (** Reflection *)
 
@@ -1470,6 +1509,7 @@ let msgdecl_generators : (string * _ msgdecl_generator) list =
     "writer", add_message_writer;
     "pretty_printer", Pretty_print.add_msgdecl_pretty_printer;
     "reflection", Reflection.add_msgdecl_reflection;
+    "wire", Reflection.add_msgdecl_wire;
   ]
 
 let typedecl_generators : (string * _ typedecl_generator) list =
