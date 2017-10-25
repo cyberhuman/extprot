@@ -19,6 +19,7 @@ type container = {
   c_default_func : Ast.str_item option;
   c_reflection : Ast.str_item option;
   c_wire : Ast.str_item option;
+  c_wire_offsets : Ast.str_item option;
 }
 
 type toplevel = Ast.str_item
@@ -37,6 +38,7 @@ let empty_container name ?default_func ty_str_item =
     c_default_func = default_func;
     c_reflection = None;
     c_wire = None;
+    c_wire_offsets = None;
   }
 
 let (|>) x f = f x
@@ -212,9 +214,14 @@ let ident_of_ctyp ty =
       <:ctyp< $id:Ast.ident_of_ctyp ty$ >>
     with Invalid_argument _ -> ty
 
-let expr_of_list l =
+let expr_of_list ?zero l =
   let _loc = Loc.ghost in
-  List.fold_right (fun x l -> <:expr< [ $x$ :: $l$ ] >>) l <:expr< [] >>
+  let zero = Option.default (<:expr< [] >>) zero in
+  List.fold_right (fun x l -> <:expr< [ $x$ :: $l$ ] >>) l zero
+
+let str_item_of_list l =
+  let _loc = Loc.ghost in
+  List.fold_right (fun x l -> <:str_item< $x$; $l$ >>) l <:str_item< >>
 
 let generate_include file =
   let _loc = Loc.mk "gen_OCaml" in
@@ -508,6 +515,7 @@ let generate_code ?width containers =
          $maybe_str_item c.c_types$;
          $maybe_str_item c.c_reflection$;
          $maybe_str_item c.c_wire$;
+         $maybe_str_item c.c_wire_offsets$;
          $maybe_str_item c.c_default_func$;
          $maybe_str_item c.c_pretty_printer$;
          $maybe_str_item c.c_reader$;
@@ -687,12 +695,18 @@ struct
           Some <:str_item< value $lid:"pp_" ^ tyname$ = $expr_of_string s$ >> }
 end
 
+let partition_constructors l =
+  let c = List.filter_map (function `Constant x -> Some x | _ -> None) l in
+  let nc = List.filter_map (function `Non_constant x -> Some x | _ -> None) l in
+    (c, nc)
+
 module Reflection =
 struct
   let _loc = Loc.mk "Gen_OCaml.Reflection"
 
   let repr_name path name = <:expr< $id:ident_with_path _loc path ("repr_"^name)$ >>
   let repr_wire_name path name = <:expr< $id:ident_with_path _loc path ("repr_wire_"^name)$ >>
+  let repr_wire_offset_name path name = <:expr< $id:ident_with_path _loc path ("repr_wire_offset_"^name)$ >>
 
   let rec repr_message bindings msgname = function
     | `Record l ->
@@ -791,12 +805,65 @@ struct
     let expr = repr_ll_message @@ Gencode.low_level_msg_def bindings mexpr in
     { c with c_wire = Some <:str_item< value $lid:"repr_wire_"^msgname$ = let open Extprot.Types in $expr$; >> }
 
-end (** Reflection *)
+  let repr_ll_leaf_offset path offsets =
+    let path = String.concat "_" (List.rev path) in
+    let offsets = List.rev_map (fun i -> <:expr< $int:string_of_int i$ >>) offsets in
+    <:str_item<
+      value $lid:"repr_wire_offset_"^path$ = $expr_of_list offsets$;
+    >>
 
-let partition_constructors l =
-  let c = List.filter_map (function `Constant x -> Some x | _ -> None) l in
-  let nc = List.filter_map (function `Non_constant x -> Some x | _ -> None) l in
-    (c, nc)
+  let repr_ll_msg_offset path offsets =
+    let path = String.concat "_" (List.rev path) in
+    let offsets = List.rev_map (fun i -> <:expr< $int:string_of_int i$ >>) offsets in
+    <:str_item<
+      value $lid:"repr_wire_offset_"^path$ msg = $expr_of_list ~zero:(<:expr< msg >>) offsets$;
+    >>
+
+  let rec repr_ll_offset path offsets = function
+  | Vint _ | Bitstring32 _ | Bitstring64 _ | Bytes _ | Htuple _ -> repr_ll_leaf_offset path offsets
+  | Sum (constructors, _) ->
+    let constant, non_constant = partition_constructors constructors in
+    let leaf_offset = match constant with [] -> [] | _ -> [repr_ll_leaf_offset path offsets] in
+    let (_offset, items) =
+      List.fold_left begin fun (offset, acc) (c, l) ->
+        offset + 1,
+        List.fold_left (fun acc t -> repr_ll_offset (c.const_name :: path) (offset :: offsets) t :: acc) acc l
+      end (0, leaf_offset) non_constant
+    in
+    str_item_of_list items
+  | Record (_name, fields, _) ->
+    str_item_of_list @@ List.mapi (repr_ll_offsets_field path offsets) fields
+  | Tuple (elements, _) ->
+    str_item_of_list @@ List.mapi (repr_ll_offsets_element path offsets) elements
+  | Message (_path, _name, _) ->
+    repr_ll_msg_offset path offsets
+
+  and repr_ll_offsets_element path offsets offset t =
+    repr_ll_offset (string_of_int offset :: path) (offset :: offsets) t
+
+  and repr_ll_offsets_field path offsets offset f =
+    repr_ll_offset (f.field_name :: path) (offset :: offsets) f.field_type
+
+  let repr_ll_offsets_message msgname = function
+  | Message_single (_ns, fields) ->
+    let repr offset (ctor, _mut, t) = repr_ll_offset [ ctor; msgname; ] [offset] t in
+    str_item_of_list @@ List.mapi repr fields
+  | Message_sum fields ->
+    let repr path offsets offset (ctor, _mut, t) = repr_ll_offset (ctor :: path) (offset :: offsets) t in
+    let repr offset (_ns, ctor, fields) = str_item_of_list @@ List.mapi (repr [ ctor; msgname; ] [offset]) fields in
+    str_item_of_list @@ List.mapi repr fields
+  | Message_alias (_path, _name) ->
+    <:str_item<
+(*
+    value $lid:msgname$ = $repr_wire_offsets_name path name$
+*)
+    >>
+
+  let add_msgdecl_wire_offsets bindings msgname mexpr _opts c =
+    let expr = repr_ll_offsets_message msgname @@ Gencode.low_level_msg_def bindings mexpr in
+    { c with c_wire_offsets = Some expr; }
+
+end (** Reflection *)
 
 module Make_reader
          (RD : sig
@@ -1510,6 +1577,7 @@ let msgdecl_generators : (string * _ msgdecl_generator) list =
     "pretty_printer", Pretty_print.add_msgdecl_pretty_printer;
     "reflection", Reflection.add_msgdecl_reflection;
     "wire", Reflection.add_msgdecl_wire;
+    "wire_offsets", Reflection.add_msgdecl_wire_offsets;
   ]
 
 let typedecl_generators : (string * _ typedecl_generator) list =
