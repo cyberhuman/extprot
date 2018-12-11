@@ -847,7 +847,14 @@ struct
   let repr_ll_offsets_message msgname = function
   | Message_single (_ns, fields) ->
     let repr offset (ctor, _mut, t) = repr_ll_offset [ ctor; msgname; ] [offset] t in
-    str_item_of_list @@ List.mapi repr fields
+    <:str_item<
+      module $String.capitalize msgname^"_wire_offsets"$ : sig
+        type t
+      end = struct
+        type t
+        $str_item_of_list @@ List.mapi repr fields$
+      end
+    >>
   | Message_sum fields ->
     let repr path offsets offset (ctor, _mut, t) = repr_ll_offset (ctor :: path) (offset :: offsets) t in
     let repr offset (_ns, ctor, fields) = str_item_of_list @@ List.mapi (repr [ ctor; msgname; ] [offset]) fields in
